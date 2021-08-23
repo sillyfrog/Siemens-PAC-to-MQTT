@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+
+import datetime
+import json
+import time
+import os
+import paho.mqtt.client
+from pymodbus.client.sync import ModbusTcpClient
+from pymodbus.payload import BinaryPayloadDecoder
+from pymodbus.constants import Endian
+
+IP = os.environ["PAC_HOST"]
+MQTT = os.environ["MQTT_HOST"]
+INTERVAL = datetime.timedelta(seconds=10)
+
+
+def decodefloat(regs):
+    return BinaryPayloadDecoder.fromRegisters(
+        regs, byteorder=Endian.Big
+    ).decode_32bit_float()
+
+
+def decodeulong(regs):
+    return BinaryPayloadDecoder.fromRegisters(
+        regs, byteorder=Endian.Big
+    ).decode_32bit_uint()
+
+
+def decodedouble(regs):
+    return BinaryPayloadDecoder.fromRegisters(
+        regs, byteorder=Endian.Big
+    ).decode_64bit_float()
+
+
+# Types:
+#  (size, decoder)
+FLOAT = 2, decodefloat
+ULONG = 2, decodeulong
+DOUBLE = 4, decodedouble
+
+OFFSET = 0
+NAME = 1
+UNIT = 2
+TYPE = 3
+
+REGISTERS = [
+    [1, "Voltage Va-n", "V", FLOAT, 300],
+    [3, "Voltage Vb-n", "V", FLOAT, 300],
+    [5, "Voltage Vc-n", "V", FLOAT, 300],
+    [7, "Voltage Va-b", "V", FLOAT, 300],
+    [9, "Voltage Vb-c", "V", FLOAT, 300],
+    [11, "Voltage Vc-a", "V", FLOAT, 300],
+    [13, "Current a", "A", FLOAT, 300],
+    [15, "Current b", "A", FLOAT, 300],
+    [17, "Current c", "A", FLOAT, 300],
+    [25, "Active Power a", "W", FLOAT, 10],
+    [27, "Active Power b", "W", FLOAT, 10],
+    [29, "Active Power c", "W", FLOAT, 10],
+    [65, "Total Active Power", "W", FLOAT, 10],
+    [801, "Active Energy Import Tariff 1", "Wh", DOUBLE, 300],
+    [809, "Active Energy Export Tariff 1", "Wh", DOUBLE, 300],
+]
+MAX_READ_SIZE = 100
+
+CLASS_MAP = {"V": "voltage", "A": "current", "Wh": "energy", "W": "power"}
+CLASS_STATE_CLASS = {"Wh": "total_increasing", "W": "measurement"}
+
+
+def normalise(name):
+    name = name.lower()
+    name = name.replace(" ", "")
+    return name
+
+
+modbusclient = ModbusTcpClient(IP, port=502, timeout=5)
+
+
+def updateregistervalues(runregisters):
+    """Reads the register data from the PAC and updates runregisters
+
+    Values are appended to each register array inplace."""
+
+    # Read the register data from the PAC
+    st = time.time()
+    for register in runregisters:
+        offset, name, unit, rtype = register
+        rawdata = modbusclient.read_input_registers(
+            address=offset,
+            count=rtype[0],
+            unit=1,
+        )
+        register.append(rtype[1](rawdata.registers))
+    print("Duration:", time.time() - st)
+
+
+def main():
+    mqtt = paho.mqtt.client.Client()
+    mqtt.connect(MQTT)
+    mqtt.loop_start()
+
+    # Publish the home assistant configuration
+    for offset, name, unit, rtype, freq in REGISTERS:
+        normname = normalise(name)
+        config = {
+            "name": name,
+            "device_class": CLASS_MAP[unit],
+            "state_topic": f"pac/{normname}/value",
+            "unique_id": f"pac_{normname}",
+            "unit_of_measurement": unit,
+        }
+        if unit in CLASS_STATE_CLASS:
+            config["state_class"] = CLASS_STATE_CLASS[unit]
+        print("Publish config:", config)
+        mqtt.publish(
+            f"homeassistant/sensor/pac/{normname}/config",
+            json.dumps(config),
+            retain=True,
+        )
+
+    modbusclient.connect()
+    # Calculate to current minute
+    worktime = datetime.datetime.now()
+    worktime = worktime.replace(minute=0, second=0, microsecond=0)
+
+    while 1:
+        print()
+        print(datetime.datetime.now(), time.asctime(), time.localtime())
+        seconds = worktime.hour * 3600 + worktime.minute * 60 + worktime.second
+        runregisters = []
+
+        # Filter out the registers to read this moment
+        for offset, name, unit, rtype, freq in REGISTERS:
+            if seconds % freq == 0:
+                runregisters.append([offset, name, unit, rtype])
+
+        # Read the register data from the PAC
+        updateregistervalues(runregisters)
+
+        # Publish the register values
+        for offset, name, unit, rtype, value in runregisters:
+            normname = normalise(name)
+            print(name, value, unit)
+            mqtt.publish(f"pac/{normname}/value", "{:0.1f}".format(value))
+
+        # Wait for the next register run
+        while datetime.datetime.now() > worktime:
+            worktime += INTERVAL
+        while 1:
+            sleeptime = worktime - datetime.datetime.now()
+            time.sleep(sleeptime.total_seconds())
+            if datetime.datetime.now() >= worktime:
+                print("BREAK", datetime.datetime.now(), worktime)
+                break
+
+
+# This is not used, it's just a reference for all availale registers for the device
+ALL_REGISTERS = [
+    [1, "Voltage Va-n", "V", FLOAT],
+    [3, "Voltage Vb-n", "V", FLOAT],
+    [5, "Voltage Vc-n", "V", FLOAT],
+    [7, "Voltage Va-b", "V", FLOAT],
+    [9, "Voltage Vb-c", "V", FLOAT],
+    [11, "Voltage Vc-a", "V", FLOAT],
+    [13, "Current a", "A", FLOAT],
+    [15, "Current b", "A", FLOAT],
+    [17, "Current c", "A", FLOAT],
+    [19, "Apparent Power a", "VA", FLOAT],
+    [21, "Apparent Power b", "VA", FLOAT],
+    [23, "Apparent Power c", "VA", FLOAT],
+    [25, "Active Power a", "W", FLOAT],
+    [27, "Active Power b", "W", FLOAT],
+    [29, "Active Power c", "W", FLOAT],
+    [31, "Reactive Power a", "var", FLOAT],
+    [33, "Reactive Power b", "var", FLOAT],
+    [35, "Reactive Power c", "var", FLOAT],
+    [37, "Power Factor a", "", FLOAT],
+    [39, "Power Factor b", "", FLOAT],
+    [41, "Power Factor c", "", FLOAT],
+    [43, "THD-R Voltage a", "%", FLOAT],
+    [45, "THD-R Voltage b", "%", FLOAT],
+    [47, "THD-R Voltage c", "%", FLOAT],
+    [49, "THD-R Current a", "%", FLOAT],
+    [51, "THD-R Current b", "%", FLOAT],
+    [53, "THD-R Current c", "%", FLOAT],
+    [55, "Frequency", "Hz", FLOAT],
+    [57, "Average Voltage Vph-n", "V", FLOAT],
+    [59, "Average Voltage Vph-ph", "V", FLOAT],
+    [61, "Average Current", "A", FLOAT],
+    [63, "Total Apparent Power", "VA", FLOAT],
+    [65, "Total Active Power", "W", FLOAT],
+    [67, "Total Reactive Power", "var", FLOAT],
+    [69, "Total Power Factor", "", FLOAT],
+    [71, "Amplitude Unbalance - Voltage", "%", FLOAT],
+    [73, "Amplitude Unbalance - Current", "%", FLOAT],
+    [75, "Maximum Voltage Va-n", "V", FLOAT],
+    [77, "Maximum Voltage Vb-n", "V", FLOAT],
+    [79, "Maximum Voltage Vc-n", "V", FLOAT],
+    [81, "Max. Voltage Va-b", "V", FLOAT],
+    [83, "Max. Voltage Vb-c", "V", FLOAT],
+    [85, "Max. Voltage Vc-a", "V", FLOAT],
+    [87, "Maximum Current a", "A", FLOAT],
+    [89, "Maximum Current b", "A", FLOAT],
+    [91, "Maximum Current c", "A", FLOAT],
+    [93, "Maximum Apparent Power a", "VA", FLOAT],
+    [95, "Maximum Apparent Power b", "VA", FLOAT],
+    [97, "Maximum Apparent Power c", "VA", FLOAT],
+    [99, "Maximum Active Power a", "W", FLOAT],
+    [101, "Maximum Active Power b", "W", FLOAT],
+    [103, "Maximum Active Power c", "W", FLOAT],
+    [105, "Maximum Reactive Power a", "var", FLOAT],
+    [107, "Maximum Reactive Power b", "var", FLOAT],
+    [109, "Maximum Reactive Power c", "var", FLOAT],
+    [111, "Maximum Power Factor a", "", FLOAT],
+    [113, "Maximum Power Factor b", "", FLOAT],
+    [115, "Maximum Power Factor c", "", FLOAT],
+    [117, "Maximum THD-R Voltage a", "%", FLOAT],
+    [119, "Maximum THD-R Voltage b", "%", FLOAT],
+    [121, "Maximum THD-R Voltage c", "%", FLOAT],
+    [123, "Maximum THD-R Current a", "%", FLOAT],
+    [125, "Maximum THD-R Current b", "%", FLOAT],
+    [127, "Maximum THD-R Current c", "%", FLOAT],
+    [129, "Max. Frequency", "Hz", FLOAT],
+    [131, "Max. Average Voltage Vph-n", "V", FLOAT],
+    [133, "Max. Average Voltage Vph-ph", "V", FLOAT],
+    [135, "Max. Average Current", "A", FLOAT],
+    [137, "Max. Total Apparent Power", "VA", FLOAT],
+    [139, "Max. Total Active Power", "W", FLOAT],
+    [141, "Max. Total Reactive Power", "var", FLOAT],
+    [143, "Maximum Total Power Factor", "", FLOAT],
+    [145, "Minimum Voltage Va-n", "V", FLOAT],
+    [147, "Minimum Voltage Vb-n", "V", FLOAT],
+    [149, "Minimum Voltage Vc-n", "V", FLOAT],
+    [151, "Min. Voltage Va-b", "V", FLOAT],
+    [153, "Min. Voltage Vb-c", "V", FLOAT],
+    [155, "Min. Voltage Vc-a", "V", FLOAT],
+    [157, "Minimum Current a", "A", FLOAT],
+    [159, "Minimum Current b", "A", FLOAT],
+    [161, "Minimum Current c", "A", FLOAT],
+    [163, "Minimum Apparent Power a", "VA", FLOAT],
+    [165, "Minimum Apparent Power b", "VA", FLOAT],
+    [167, "Minimum Apparent Power c", "VA", FLOAT],
+    [169, "Minimum Active Power a", "W", FLOAT],
+    [171, "Minimum Active Power b", "W", FLOAT],
+    [173, "Minimum Active Power c", "W", FLOAT],
+    [175, "Minimum Reactive Power a", "var", FLOAT],
+    [177, "Minimum Reactive Power b", "var", FLOAT],
+    [179, "Minimum Reactive Power c", "var", FLOAT],
+    [181, "Minimum Power Factor a", "", FLOAT],
+    [183, "Minimum Power Factor b", "", FLOAT],
+    [185, "Minimum Power Factor c", "", FLOAT],
+    [187, "Min. Frequency", "Hz", FLOAT],
+    [189, "Min. Average Voltage Vph-n", "V", FLOAT],
+    [191, "Min. Average Voltage Vph-ph", "V", FLOAT],
+    [193, "Min. Average Current", "A", FLOAT],
+    [195, "Min. Total Apparent Power", "VA", FLOAT],
+    [197, "Min. Total Active Power", "W", FLOAT],
+    [199, "Min. Total Reactive Power", "var", FLOAT],
+    [201, "Minimum Total Power Factor", "var", FLOAT],
+    [203, "Limit Violations", "", ULONG],
+    [205, "Device Diagnostics and Device Status", "", ULONG],
+    [207, "Status of the digital outputs", "", ULONG],
+    [209, "Status of the digital inputs", "", ULONG],
+    [211, "Active Tariff", "", ULONG],
+    [213, "Working hours counter", "s", ULONG],
+    [215, "Universal counter", "", ULONG],
+    [217, "Relevant Parameter Changes Counter", "", ULONG],
+    [219, "Counter All Parameter Changes", "", ULONG],
+    [221, "Counter Limit Violations", "", ULONG],
+    [501, "Demand Active Power - Import", "W", FLOAT],
+    [503, "Demand Reactive Power - Import", "var", FLOAT],
+    [505, "Demand Active Power - Export", "W", FLOAT],
+    [507, "Demand Reactive Power - Export", "var", FLOAT],
+    [509, "Maximum Active Power Reading during the period", "W", FLOAT],
+    [511, "Minimum Active Power Reading during the period", "W", FLOAT],
+    [513, "Maximum Reactive Power Reading during the period", "var", FLOAT],
+    [515, "Minimum Reactive Power Reading during the period", "var", FLOAT],
+    [517, "Demand Period", "s", ULONG],
+    [519, "Time Since Start of the active demand period", "s", ULONG],
+    [801, "Active Energy Import Tariff 1", "Wh", DOUBLE],
+    [805, "Active Energy Import Tariff 2", "Wh", DOUBLE],
+    [809, "Active Energy Export Tariff 1", "Wh", DOUBLE],
+    [813, "Active Energy Export Tariff 2", "Wh", DOUBLE],
+    [817, "Reactive Energy Import Tariff 1", "varh", DOUBLE],
+    [821, "Reactive Energy Import Tariff 2", "varh", DOUBLE],
+    [825, "Reactive Energy Export Tariff 1", "varh", DOUBLE],
+    [829, "Reactive Energy Export Tariff 2", "varh", DOUBLE],
+    [833, "Apparent Energy Tariff 1", "VAh", DOUBLE],
+    [837, "Apparent Energy Tariff 2", "VAh", DOUBLE],
+]
+
+if __name__ == "__main__":
+    main()
